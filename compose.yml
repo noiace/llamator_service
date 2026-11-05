@@ -1,0 +1,145 @@
+services:
+    backend:
+        build:
+            context: ./back
+        ports:
+            - 8000:8000
+        depends_on:
+            postgres:
+                condition: service_started
+            redis:
+                condition: service_started
+            migrations:
+                condition: service_completed_successfully
+            kafka:
+                condition: service_started
+        environment:
+            DATABASE_URL: ${DATABASE_URL}
+            SYNC_DATABASE_URL: ${SYNC_DATABASE_URL}
+            REDIS_URL: ${REDIS_URL}
+            LLM_MASTER_KEY: ${LLM_MASTER_KEY}
+            KAFKA_BOOTSTRAP_SERVER: ${KAFKA_BOOTSTRAP_SERVER}
+            KAFKA_CONSUMER_TOPIC: ${KAFKA_CONSUMER_TOPIC}
+            KAFKA_PRODUCER_TOPIC: ${KAFKA_PRODUCER_TOPIC}
+        networks:
+            - redteam_network
+
+    migrations:
+        build:
+            context: ./back
+        working_dir: /app
+        command: uv run alembic upgrade head
+        depends_on:
+            - postgres
+        environment:
+            DATABASE_URL: ${DATABASE_URL}
+            SYNC_DATABASE_URL: ${SYNC_DATABASE_URL}
+        networks:
+            - redteam_network
+
+    postgres:
+        image: postgres:18.1
+        environment:
+            POSTGRES_USER: ${POSTGRES_USER:-redteam_user}
+            POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-strongpassword}
+            POSTGRES_DB: ${POSTGRES_DB:-llamator_db}
+        ports:
+            - '5432:5432'
+        volumes:
+            - postgres_redteam_data:/var/lib/postgresql/18/docker
+        networks:
+            - redteam_network
+
+    redis:
+        image: redis:8.6
+        ports:
+            - 6379:6379
+        volumes:
+            - redis_data:/data
+        networks:
+            - redteam_network
+
+    worker:
+        build:
+            context: ./back
+        depends_on:
+            postgres:
+                condition: service_started
+            redis:
+                condition: service_started
+            migrations:
+                condition: service_completed_successfully
+            kafka:
+                condition: service_started
+        environment:
+            DATABASE_URL: ${DATABASE_URL}
+            SYNC_DATABASE_URL: ${SYNC_DATABASE_URL}
+            REDIS_URL: ${REDIS_URL}
+            LLM_MASTER_KEY: ${LLM_MASTER_KEY}
+            KAFKA_BOOTSTRAP_SERVER: ${KAFKA_BOOTSTRAP_SERVER}
+            KAFKA_CONSUMER_TOPIC: ${KAFKA_CONSUMER_TOPIC}
+            KAFKA_PRODUCER_TOPIC: ${KAFKA_PRODUCER_TOPIC}
+        command: uv run celery -A worker.celery:celery_app worker --loglevel=info --pool=solo
+        networks:
+            - redteam_network
+
+    kafka:
+        image: apache/kafka:3.7.0
+        ports:
+            - '9092:9092'
+        environment:
+            KAFKA_NODE_ID: 1
+            KAFKA_PROCESS_ROLES: broker,controller
+            KAFKA_LISTENERS: PLAINTEXT://0.0.0.0:9092,CONTROLLER://0.0.0.0:9093
+            KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092
+            KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+            KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT
+            KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093
+            KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+            KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+            KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+            CLUSTER_ID: 'redteam-cluster-id-123456'
+        networks:
+            - redteam_network
+    kafka-consumer:
+        build:
+            context: ./back
+        command: uv run python -m kafka.consumer
+        depends_on:
+            kafka:
+                condition: service_started
+            postgres:
+                condition: service_started
+        environment:
+            - PYTHONUNBUFFERED=1
+            - DATABASE_URL=${DATABASE_URL}
+            - SYNC_DATABASE_URL=${SYNC_DATABASE_URL}
+            - KAFKA_BOOTSTRAP_SERVER=${KAFKA_BOOTSTRAP_SERVER}
+            - KAFKA_CONSUMER_TOPIC=${KAFKA_CONSUMER_TOPIC}
+            - KAFKA_PRODUCER_TOPIC=${KAFKA_PRODUCER_TOPIC}
+            - REDIS_URL=${REDIS_URL}
+            - LLM_MASTER_KEY=${LLM_MASTER_KEY}
+        networks:
+            - redteam_network
+    core:
+        build:
+            context: ./tests_for_llamator_core
+        ports:
+            - '8081:8081'
+        depends_on:
+            kafka:
+                condition: service_started
+        environment:
+            KAFKA_BOOTSTRAP_SERVER: ${KAFKA_BOOTSTRAP_SERVER}
+            # Перекрестное чтение топиков: ядро читает то, что пишет питон, и наоборот
+            CONSUMER_TOPIC: ${KAFKA_PRODUCER_TOPIC}
+            PRODUCER_TOPIC: ${KAFKA_CONSUMER_TOPIC}
+        networks:
+            - redteam_network
+
+volumes:
+    postgres_redteam_data:
+    redis_data:
+
+networks:
+    redteam_network:
